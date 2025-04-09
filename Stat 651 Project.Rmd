@@ -11,6 +11,9 @@ library(tidyverse)
 library(dplyr)
 library(MASS)
 library(coda)
+library(MCMCpack)
+library(reshape2)
+library(mvtnorm)
 ```
 
 ```{r}
@@ -113,70 +116,111 @@ I would say that the normality assumption is reasonable here. The distribution o
 # Gibbs Sampler
 
 ```{r}
+# rats = readxl::read_excel('./ratdata.xlsx')
+# rats <- melt(rats, id.vars = c("age"))
+# colnames(rats) <- c("age",'id','weight')
+# rat_data <- lapply(unique(rats$id), function(j) {
+#     that_rat <- rats[rats$id == j, ]
+#     that_rat$weight          # Response variable
+# })
+# X_i <- cbind(rep(1, 5), c(8, 15, 22, 29, 36))  # Define X_i once
+# XtX <- t(X_i) %*% X_i
+# Y_matrix <- do.call(cbind, rat_data)  # Combine all Y_i into a matrix (5 x 30)
+
+# Reshape data
+rats <- melt(ratdata, id.vars = c("age"))
+colnames(rats) <- c("age",'id','weight')
+
 # Priors
 lambda0 <- 0.1
 nu0 <- 0.1
-eta <- c(0, 0)
+eta <- matrix(c(0,0), nrow=2)
 Sigma <- matrix(c(10, 0, 0, 10), nrow=2, ncol=2)
+Sigma_inv <- solve(Sigma)
 C <- matrix(c(5, 0, 0, 5), nrow=2, ncol=2)
+C_inv <- solve(C)
+V <- solve(30 * Sigma_inv + C_inv)
 
 
 set.seed(123)
 
 # Prepare data
-Y <- as.matrix(ratdata[, 1:30])
+# Y <- as.matrix(ratdata[, 1:30])
 age <- ratdata$age
-n <- ncol(Y)  # number of rats = 30
-t <- length(age)  # number of time points = 5
+n <- 30  # number of rats
+t <- 5  # number of time points = 5
 
-# Design matrix for each rat (same across rats)
-X_list <- lapply(1:n, function(i) cbind(1, age))
-Y_list <- lapply(1:n, function(i) Y[, i])
+# # Design matrix for each rat (same across rats)
+# X_list <- lapply(1:n, function(i) cbind(1, age))
+# Y_list <- lapply(1:n, function(i) Y[, i])
+
+# Design matrix
+rat_data <- lapply(unique(rats$id), function(j) {
+    that_rat <- rats[rats$id == j, ]
+    that_rat$weight          # Response variable
+})
+Xi <- cbind(rep(1, 5), c(8, 15, 22, 29, 36))  # Define X_i once
+XtX <- t(Xi) %*% Xi
+Y_matrix <- do.call(cbind, rat_data)  # Combine all Y_i into a matrix (5 x 30)
 
 # Hyperparameters
-n_iter <- 10000
-burn_in <- 1000
+n_iter <- 100000
+burn_in <- 10000
+thin <- 10
 
 # Storage
-theta <- array(NA, dim = c(n, 2, n_iter))  # alpha, beta for each rat
-mu <- matrix(NA, nrow = n_iter, ncol = 2)
-tau <- numeric(n_iter)
+alphas = matrix(nrow=n_iter,ncol=30)
+betas = matrix(nrow=n_iter,ncol=30)
+mu_cs = matrix(nrow=n_iter,ncol=2)
+taus = matrix(nrow=n_iter,ncol=1)
+sses = rep(0,n_iter)
 
 # Initialize
-theta_mean <- matrix(0, nrow = n, ncol = 2)
-mu[1, ] <- c(0, 0)
-tau[1] <- 1
+alpha = rep(0,30)
+beta = rep(0,30)
+mu_c = rep(0,2)
+tau = 1
 
 # Gibbs sampler
-for (iter in 2:n_iter) {
+for (i in 1:n_iter) {
+  
   # --- 1. Sample theta_i | Y_i, mu, tau ---
-  for (i in 1:n) {
-    Xi <- X_list[[i]]
-    Yi <- Y_list[[i]]
-    D_inv <- (1/tau[iter - 1]) * t(Xi) %*% Xi + solve(Sigma)
-    D <- solve(D_inv)
-    m <- D %*% (tau[iter - 1] * t(Xi) %*% Yi + solve(Sigma) %*% mu[iter - 1, ])
-    theta[i, , iter] <- mvrnorm(1, m, D)
-  }
+  # Compute D_i_inv for all groups (same for all 30 rats)
+  Di_inv <- (1/tau) * XtX + Sigma_inv
+  Di <- solve(Di_inv)
+  
+  # Compute means (2 × 30 matrix)
+  means <- Di %*% ((1/tau) * (t(Xi) %*% Y_matrix) + Sigma_inv %*% matrix(mu_c, ncol=30, nrow=2, byrow=FALSE))
+  
+  # Draw samples for all 30 groups at once (each row is a rat)
+  new_params <- t(rmvnorm(n = 30, mean = rep(0, 2), sigma = Di)) + means  # Ensuring correct shape
+  
+  # Extract alpha and beta
+  alphas[i, ] <- alpha <- new_params[1, ]  # First row is alpha
+  betas[i, ] <- beta <- new_params[2, ]   # Second row is beta
 
+  
   # --- 2. Sample mu | theta, tau ---
-  theta_bar <- colMeans(theta[, , iter])
-  V_mu_inv <- 30 * solve(Sigma) + solve(C)
-  V_mu <- solve(V_mu_inv)
-  m_mu <- V_mu %*% (30 * solve(Sigma) %*% theta_bar + solve(C) %*% eta)
-  mu[iter, ] <- mvrnorm(1, m_mu, V_mu)
+  ## Update the group parameters
+  theta_bar = matrix(c(mean(alpha), mean(beta)), nrow=2)
+  mu_c = rmvnorm(n = 1, 
+                 mean = V %*% (30 * Sigma_inv %*% theta_bar + C_inv %*% eta),
+                 sigma = V)
+  mu_c = as.vector(mu_c)
+  mu_cs[i,] = mu_c
 
+  
   # --- 3. Sample tau | theta ---
-  rss <- 0
-  for (i in 1:n) {
-    Xi <- X_list[[i]]
-    Yi <- Y_list[[i]]
-    res <- Yi - Xi %*% theta[i, , iter]
-    rss <- rss + sum(res^2)
-  }
-  shape <- (t * n + nu0) / 2
-  rate <- (rss + nu0 * lambda0) / 2
-  tau[iter] <- rgamma(1, shape, rate)
+  # Compute SSE efficiently
+  residuals <- Y_matrix - Xi %*% new_params
+  sse <- sum(residuals^2)
+  sses[i] <- sse  # Store SSE
+  
+  # Update tau
+  tau <- rinvgamma(n=1,
+                   shape = (nu0 + 150)/ 2,
+                   scale = (1/2) * (nu0 * lambda0 + sse))
+  taus[i] <- tau
 }
 
 
@@ -184,136 +228,260 @@ for (iter in 2:n_iter) {
 # POSTERIOR INFERENCE
 
 # Remove burn-in
-theta_post <- theta[, , (burn_in+1):n_iter]
-mu_post <- mu[(burn_in+1):n_iter, ]
-tau_post <- tau[(burn_in+1):n_iter]
+alpha_post <- alphas[(burn_in+1):n_iter, ]
+beta_post <- betas[(burn_in+1):n_iter, ]
+alpha_c_post <- mu_cs[(burn_in+1):n_iter, 1]
+beta_c_post <- mu_cs[(burn_in+1):n_iter, 2]
+tau_post <- taus[(burn_in+1):n_iter]
 
-# Means and credible intervals
-mu_est <- colMeans(mu_post)
-mu_ci <- apply(mu_post, 2, quantile, probs = c(0.025, 0.975))
+# Thin
+alpha_post <- alpha_post[seq(1, nrow(alpha_post), by=thin), ]
+beta_post <- beta_post[seq(1, nrow(beta_post), by=thin), ]
+alpha_c_post <- alpha_c_post[seq(1, length(alpha_c_post), by=thin)]
+beta_c_post <- beta_c_post[seq(1, length(beta_c_post), by=thin)]
+tau_post <- tau_post[seq(1, length(tau_post), by=thin)]
+
+# Compute posterior means, variances, and credible intervals
+alpha_est <- apply(alpha_post, 2, mean)
+alpha_var <- apply(alpha_post, 2, var)
+alpha_ci <- apply(alpha_post, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+
+beta_est <- apply(beta_post, 2, mean)
+beta_var <- apply(beta_post, 2, mean)
+beta_ci <- apply(beta_post, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+
+alpha_c_est <- mean(alpha_c_post)
+alpha_c_var <- var(alpha_c_post)
+alpha_c_ci <- quantile(alpha_c_post, probs = c(0.025, 0.975))
+beta_c_est <- mean(beta_c_post)
+beta_c_var <- var(beta_c_post)
+beta_c_ci <- quantile(beta_c_post, probs = c(0.025, 0.975))
 
 tau_est <- mean(tau_post)
+tau_var <- var(tau_post)
 tau_ci <- quantile(tau_post, probs = c(0.025, 0.975))
 
+# Print posterior estimates
+cat("Posterior Mean of alpha:\n", alpha_est, "\n")
+cat("Posterior Variance of alpha:\n", alpha_var, "\n")
+cat("95% CI for alpha:\n", alpha_ci, "\n\n")
 
-cat("Posterior Mean of mu_1:\n", mu_est[1], "\n")
-cat("Posterior Mean of mu_2:\n", mu_est[2], "\n")
-cat("95% CI for mu_1:\n", mu_ci[c(1,2)], "\n")
-cat("95% CI for mu_2:\n", mu_ci[c(3,4)], "\n\n")
+cat("Posterior Mean of beta:\n", beta_est, "\n")
+cat("Posterior Variance of beta:\n", beta_var, "\n")
+cat("95% CI for beta:\n", beta_ci, "\n\n")
+
+cat("Posterior Mean of alpha_c:\n", alpha_c_est, "\n")
+cat("Posterior Variance of alpha_c:\n", alpha_c_var, "\n")
+cat("95% CI for alpha_c:\n", alpha_c_ci, "\n\n")
+
+cat("Posterior Mean of beta_c:\n", beta_c_est, "\n")
+cat("Posterior Variance of beta_c:\n", beta_c_var, "\n")
+cat("95% CI for beta_c:\n", beta_c_ci, "\n\n")
 
 cat("Posterior Mean of tau:\n", tau_est, "\n")
+cat("Posterior Variance of tau:\n", tau_var, "\n")
 cat("95% CI for tau:\n", tau_ci, "\n")
 
-# Number of rats and iterations
-n_rats <- dim(theta_post)[1]
-n_samples <- dim(theta_post)[3]
 
-# Create summary table
-theta_summary <- data.frame(
-  Rat = 1:n_rats,
-  Alpha_Mean = numeric(n_rats),
-  Alpha_Lower = numeric(n_rats),
-  Alpha_Upper = numeric(n_rats),
-  Beta_Mean = numeric(n_rats),
-  Beta_Lower = numeric(n_rats),
-  Beta_Upper = numeric(n_rats)
+# Create a data frame to store the results
+ci_table <- data.frame(
+  Alpha_Mean = alpha_est,           # Posterior mean of alpha
+  Alpha_Lower = alpha_ci[1, ],    # Lower bound of alpha CI
+  Alpha_Upper = alpha_ci[2, ],    # Upper bound of alpha CI
+  Beta_Mean = beta_est,             # Posterior mean of beta
+  Beta_Lower = beta_ci[1, ],      # Lower bound of beta CI
+  Beta_Upper = beta_ci[2, ]       # Upper bound of beta CI
 )
 
-for (i in 1:n_rats) {
-  alpha_samples <- theta_post[i, 1, ]
-  beta_samples <- theta_post[i, 2, ]
-  
-  theta_summary$Alpha_Mean[i] <- mean(alpha_samples)
-  theta_summary$Alpha_Lower[i] <- quantile(alpha_samples, 0.025)
-  theta_summary$Alpha_Upper[i] <- quantile(alpha_samples, 0.975)
-  
-  theta_summary$Beta_Mean[i] <- mean(beta_samples)
-  theta_summary$Beta_Lower[i] <- quantile(beta_samples, 0.025)
-  theta_summary$Beta_Upper[i] <- quantile(beta_samples, 0.975)
-}
-
-# View summary
-print(theta_summary)
+# View the table
+print(ci_table)
 ```
 
 ```{r}
-# CONVERGENCE DIAGNOSTICS
+# CONVERGENCE GRAPHICAL DIAGNOSTICS
 
-
-mcmc_mu <- mcmc(mu_post)
+# Convert to mcmc objects
+mcmc_alpha <- mcmc(alpha_post)
+mcmc_beta <- mcmc(beta_post)
+mcmc_alpha_c <- mcmc(alpha_c_post)
+mcmc_beta_c <- mcmc(beta_c_post)
 mcmc_tau <- mcmc(tau_post)
 
 # Trace plots
-traceplot(mcmc_mu[,1], main = "Traceplot of mu_1")
-traceplot(mcmc_mu[,2], main = "Traceplot of mu_2")
+par(mfrow = c(1,1))
+traceplot(mcmc_alpha_c, main = "Traceplot of alpha_c")
+traceplot(mcmc_beta_c, main = "Traceplot of beta_c")
 traceplot(mcmc_tau, main = "Traceplot of tau")
 
-# Autocorrelation
-acf(mcmc_tau, main = "ACF of tau")
-
-# Gelman diagnostics (if using multiple chains)
-# gelman.diag(as.mcmc.list(list(chain1, chain2)))
-
-# Posterior density
-densplot(mcmc_mu[,1], main = "Posterior density of mu[1]")
-densplot(mcmc_mu[,2], main = "Posterior density of mu[2]")
-densplot(mcmc_tau, main = "Posterior density of tau")
-
-
-
-
-# Get alpha and beta
-alpha_post <- theta_post[, 1, ]
-beta_post <- theta_post[, 2, ]
-
-# Reshape the alpha and beta samples into a long format for plotting
-alpha_df <- data.frame(iteration = rep(1:9000, each = 30),
-                       value = as.vector(t(alpha_post)),  # Transpose to stack the columns (observations)
-                       observation = rep(1:30, times = 9000),
-                       param = "alpha")
-
-beta_df <- data.frame(iteration = rep(1:9000, each = 30),
-                      value = as.vector(t(beta_post)),
-                      observation = rep(1:30, times = 9000),
-                      param = "beta")
-
-# Combine the data frames for plotting
-theta_df <- rbind(alpha_df, beta_df)
-
 # Trace plots for alpha
-par(mfrow = c(5,2))
+png("alpha_trace_plots.png", width=1500, height=1000)
+par(mfrow=c(6,5))
 for (i in 1:30) {
   # Plot trace for alpha (i-th observation)
-  plot(1:9000, alpha_post[i, ], type = "l", 
-       main = paste("Trace plot for Alpha (Observation", i, ")"),
+  plot(1:length(alpha_post[,1]), alpha_post[, i], type = "l", 
+       main = paste("Trace plot for Alpha", i),
        xlab = "Iteration", ylab = "Alpha Value", col = "black")
 }
+dev.off()
 
 # Trace plots for beta
-par(mfrow = c(5,2))
+png("beta_trace_plots.png", width=1500, height=1000)
+par(mfrow=c(6,5))
 for (i in 1:30) {
   # Plot trace for beta (i-th observation)
-  plot(1:9000, beta_post[i, ], type = "l", 
-       main = paste("Trace plot for Beta (Observation", i, ")"),
+  plot(1:length(beta_post[,1]), beta_post[, i], type = "l", 
+       main = paste("Trace plot for Beta", i),
        xlab = "Iteration", ylab = "Beta Value", col = "black")
 }
 
+dev.off()
 
 
+# Autocorrelation
+par(mfrow=c(1,1))
+acf(mcmc_tau, main = "ACF of tau")
+acf(mcmc_alpha_c, main = "ACF of alpha_c")
+acf(mcmc_beta_c, main = "ACF of beta_c")
 
 # ACF plots for alpha
-par(mfrow = c(5,2))
+png("alpha_acf_plots.png", width=1500, height=1000)
+par(mfrow=c(6,5))
 for (i in 1:30) {
   # ACF for alpha (i-th observation)
-  acf(alpha_post[i, ], main = paste("ACF for Alpha (Observation", i, ")"))
+  acf(alpha_post[, i], main = paste("ACF for Alpha", i))
 }
+dev.off()
 
 # ACF plots for beta
-par(mfrow = c(5,2))
+png("beta_acf_plots.png", width=1500, height=1000)
+par(mfrow=c(6,5))
 for (i in 1:30) {
   # ACF for beta (i-th observation)
-  acf(beta_post[i, ], main = paste("ACF for Beta (Observation", i, ")"))
+  acf(beta_post[, i], main = paste("ACF for Beta", i))
 }
+dev.off()
+
+# Posterior densities
+par(mfrow=c(1,1))
+densplot(mcmc_alpha_c, main = "Posterior density of alpha_c")
+densplot(mcmc_beta_c, main = "Posterior density of beta_c")
+densplot(mcmc_tau, main = "Posterior density of tau")
+
+# Posterior densities for alpha
+png("alpha_density_plots.png", width=1500, height=1000)
+par(mfrow=c(6,5))
+for (i in 1:30) {
+  # Density Plot for alpha (i-th observation)
+  densplot(mcmc_alpha[, i], main = paste("Density Plot for Alpha", i))
+}
+dev.off()
+
+# Posterior densities for beta
+png("beta_density_plots.png", width=1500, height=1000)
+par(mfrow=c(6,5))
+for (i in 1:30) {
+  # Density Plot for beta (i-th observation)
+  densplot(mcmc_beta[, i], main = paste("Density Plot for Beta", i))
+}
+dev.off()
 ```
 
+```{r}
+# Geweke Tests for each parameter
+
+geweke_results_alpha <- apply(alpha_post, 2, function(chain) {
+  geweke.diag(mcmc(chain))$z
+})
+
+geweke_results_beta <- apply(beta_post, 2, function(chain) {
+  geweke.diag(mcmc(chain))$z
+})
+
+geweke_results_alpha_c <- geweke.diag(mcmc_alpha_c)$z
+
+geweke_results_beta_c <- geweke.diag(mcmc_beta_c)$z
+
+geweke_results_tau <- geweke.diag(mcmc_tau)$z
+
+print(list(geweke_results_alpha, geweke_results_beta, geweke_results_alpha_c, geweke_results_beta_c, geweke_results_tau))
+```
+
+None of them are far away enough from 0 to worry me too much, so I'm happy to conclude that all these have done a good job of converging!
+
+
+
+
+
+
+
+
+
+
+
+# Connor's Code
+
+
+```{r}
+# lambda0 = 0.1
+# nu0 = 0.1
+# eta = matrix(c(0,0),nrow=2)
+# Sigma = diag(x=10,2)
+# Sigma_inv = solve(Sigma)
+# C = diag(x=5,2)
+# C_inv = solve(C)
+# V = solve(30 * Sigma_inv + C_inv)
+# rats = readxl::read_excel('./ratdata.xlsx')
+# rats <- melt(rats, id.vars = c("age"))
+# colnames(rats) <- c("age",'id','weight')
+# rat_data <- lapply(unique(rats$id), function(j) {
+#     that_rat <- rats[rats$id == j, ]
+#     that_rat$weight          # Response variable
+# })
+# X_i <- cbind(rep(1, 5), c(8, 15, 22, 29, 36))  # Define X_i once
+# XtX <- t(X_i) %*% X_i
+# Y_matrix <- do.call(cbind, rat_data)  # Combine all Y_i into a matrix (5 x 30)
+# n_iter <- 10000
+# alphas = matrix(nrow=n_iter,ncol=30)
+# betas = matrix(nrow=n_iter,ncol=30)
+# mu_cs = matrix(nrow=n_iter,ncol=2)
+# taus = matrix(nrow=n_iter,ncol=1)
+# alpha = rep(0,30)
+# beta = rep(0,30)
+# mu_c = rep(0,2)
+# tau = 1
+# sses = rep(0,n_iter)
+# #pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
+# for(i in 1:n_iter){
+#     ## Update the Invidual paramters
+#     # Compute D_i_inv for all groups (same for all 30 rats)
+#     D_i_inv <- (1/tau) * XtX + Sigma_inv
+#     D_i <- solve(D_i_inv)
+#     # Compute means (2 × 30 matrix)
+#     means <- D_i %*% ((1/tau) * (t(X_i) %*% Y_matrix) + Sigma_inv %*% matrix(mu_c, ncol=30, nrow=2, byrow=FALSE))
+#     # Draw samples for all 30 groups at once (each row is a rat)
+#     new_params <- t(rmvnorm(n = 30, mean = rep(0, 2), sigma = D_i)) + means  # Ensuring correct shape
+#     # Extract alpha and beta
+#     alphas[i, ] <- alpha <- new_params[1, ]  # First row is alpha
+#     betas[i, ] <- beta <- new_params[2, ]   # Second row is beta
+#     # Compute SSE efficiently
+#     residuals <- Y_matrix - X_i %*% new_params
+#     sse <- sum(residuals^2)
+#     sses[i] <- sse  # Store SSE
+#     ## Update the group parameters
+#     theta_bar = matrix(c(mean(alpha),mean(beta)),nrow=2)
+#     mu_c = rmvnorm(n = 1,
+#                     mean = V %*% (30 * Sigma_inv %*% theta_bar + C_inv %*% eta),
+#                     sigma = V
+#                 )
+#     mu_c = as.vector(mu_c)
+#     mu_cs[i,] = mu_c
+#     ## update tau
+#     tau <- rinvgamma(n=1,
+#                         shape = (nu0 + 150)/ 2,
+#                         scale = (1/2) * (nu0 * lambda0 + sse)
+#                     )
+#     taus[i] <- tau
+#     #setTxtProgressBar(pb, i)
+# }
+```
 
