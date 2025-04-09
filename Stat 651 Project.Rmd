@@ -1,0 +1,318 @@
+---
+title: "Stat 651 Project"
+author: "Talmage Hilton"
+date: "2025-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE, waning=FALSE}
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(MASS)
+library(coda)
+```
+
+```{r}
+# Read in data
+ratdata <- read_excel("ratdata.xlsx")
+
+# Pivot longer to get tidy data
+rat_long <- ratdata %>%
+  pivot_longer(cols = starts_with("rat"), names_to = "rat", values_to = "weight")
+```
+
+
+
+# EDA
+
+```{r, warning=FALSE}
+# Weights of each rat
+ggplot(rat_long, aes(x = age, y = weight, group = rat, color = rat)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Growth Curves for Each Rat", x = "Age (days)", y = "Weight (g)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# Growth rate for each rat
+rat_diff <- ratdata %>%
+  dplyr::select(-age) %>%
+  mutate(across(everything(), ~ c(NA, diff(.)))) %>%
+  mutate(age = ratdata$age)
+
+rat_diff_long <- rat_diff %>%
+  pivot_longer(cols = -age, names_to = "rat", values_to = "growth_rate")
+
+ggplot(rat_diff_long, aes(x = age, y = growth_rate, group = rat, color = rat)) +
+  geom_line() +
+  labs(title = "Growth Rate by Age", x = "Age (days)", y = "Δ Weight (g)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# Boxplots at each age
+ggplot(rat_long, aes(x = factor(age), y = weight)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Rat Weights at Each Age", x = "Age (days)", y = "Weight (g)") +
+  theme_minimal()
+```
+
+The growth curves show that the rats grow in a mostly linear fashion. Obviously there is some variability, but overall I'd say that it's pretty linear. The growth rates are not very consistent (lots of ups and downs), but overall they're all pretty similar. For the most part the growth rate slows down between days 15-22, then speed up between days 22-29, and then decrease again from days 29-36. However, there are a few rate that increase in growth rate during the last time period. There are some exceptions to the rule here, but overall I'd say that the Normal model for $Y_{ij}$ is fairly reasonable.
+
+
+
+
+
+# Question 2
+
+```{r}
+# Nest the data by rat
+rat_nested <- rat_long %>%
+  group_by(rat) %>%
+  nest()
+
+# Fit regression to each nested dataset
+rat_models <- rat_nested %>%
+  mutate(model = map(data, ~lm(weight ~ age, data = .)))
+
+# Extract coefficients from each model
+rat_coefs <- rat_models %>%
+  mutate(coefs = map(model, broom::tidy)) %>%
+  unnest(coefs) %>%
+  dplyr::select(rat, term, estimate) %>%
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  rename(alpha_hat = `(Intercept)`, beta_hat = age)
+
+
+# Check Normality of thetas
+
+# Histogram of intercepts
+ggplot(rat_coefs, aes(x = alpha_hat)) +
+  geom_histogram(bins = 10, fill = "skyblue") +
+  labs(title = "Histogram of Intercepts (alpha_i)", x = expression(hat(alpha)[i]))
+
+# Histogram of slopes
+ggplot(rat_coefs, aes(x = beta_hat)) +
+  geom_histogram(bins = 10, fill = "lightgreen") +
+  labs(title = "Histogram of Slopes (beta_i)", x = expression(hat(beta)[i]))
+
+# QQ plots
+qqnorm(rat_coefs$alpha_hat); qqline(rat_coefs$alpha_hat, col = "blue")
+qqnorm(rat_coefs$beta_hat); qqline(rat_coefs$beta_hat, col = "blue")
+
+```
+
+I would say that the normality assumption is reasonable here. The distribution of intercepts is approximately normal. The distribution of slopes is a little right skewed, but I wouldn't say it's too egregious. The Q-Q plots also aren't too terrible.
+
+
+
+
+
+# Gibbs Sampler
+
+```{r}
+# Priors
+lambda0 <- 0.1
+nu0 <- 0.1
+eta <- c(0, 0)
+Sigma <- matrix(c(10, 0, 0, 10), nrow=2, ncol=2)
+C <- matrix(c(5, 0, 0, 5), nrow=2, ncol=2)
+
+
+set.seed(123)
+
+# Prepare data
+Y <- as.matrix(ratdata[, 1:30])
+age <- ratdata$age
+n <- ncol(Y)  # number of rats = 30
+t <- length(age)  # number of time points = 5
+
+# Design matrix for each rat (same across rats)
+X_list <- lapply(1:n, function(i) cbind(1, age))
+Y_list <- lapply(1:n, function(i) Y[, i])
+
+# Hyperparameters
+n_iter <- 10000
+burn_in <- 1000
+
+# Storage
+theta <- array(NA, dim = c(n, 2, n_iter))  # alpha, beta for each rat
+mu <- matrix(NA, nrow = n_iter, ncol = 2)
+tau <- numeric(n_iter)
+
+# Initialize
+theta_mean <- matrix(0, nrow = n, ncol = 2)
+mu[1, ] <- c(0, 0)
+tau[1] <- 1
+
+# Gibbs sampler
+for (iter in 2:n_iter) {
+  # --- 1. Sample theta_i | Y_i, mu, tau ---
+  for (i in 1:n) {
+    Xi <- X_list[[i]]
+    Yi <- Y_list[[i]]
+    D_inv <- (1/tau[iter - 1]) * t(Xi) %*% Xi + solve(Sigma)
+    D <- solve(D_inv)
+    m <- D %*% (tau[iter - 1] * t(Xi) %*% Yi + solve(Sigma) %*% mu[iter - 1, ])
+    theta[i, , iter] <- mvrnorm(1, m, D)
+  }
+
+  # --- 2. Sample mu | theta, tau ---
+  theta_bar <- colMeans(theta[, , iter])
+  V_mu_inv <- 30 * solve(Sigma) + solve(C)
+  V_mu <- solve(V_mu_inv)
+  m_mu <- V_mu %*% (30 * solve(Sigma) %*% theta_bar + solve(C) %*% eta)
+  mu[iter, ] <- mvrnorm(1, m_mu, V_mu)
+
+  # --- 3. Sample tau | theta ---
+  rss <- 0
+  for (i in 1:n) {
+    Xi <- X_list[[i]]
+    Yi <- Y_list[[i]]
+    res <- Yi - Xi %*% theta[i, , iter]
+    rss <- rss + sum(res^2)
+  }
+  shape <- (t * n + nu0) / 2
+  rate <- (rss + nu0 * lambda0) / 2
+  tau[iter] <- rgamma(1, shape, rate)
+}
+
+
+
+# POSTERIOR INFERENCE
+
+# Remove burn-in
+theta_post <- theta[, , (burn_in+1):n_iter]
+mu_post <- mu[(burn_in+1):n_iter, ]
+tau_post <- tau[(burn_in+1):n_iter]
+
+# Means and credible intervals
+mu_est <- colMeans(mu_post)
+mu_ci <- apply(mu_post, 2, quantile, probs = c(0.025, 0.975))
+
+tau_est <- mean(tau_post)
+tau_ci <- quantile(tau_post, probs = c(0.025, 0.975))
+
+
+cat("Posterior Mean of mu_1:\n", mu_est[1], "\n")
+cat("Posterior Mean of mu_2:\n", mu_est[2], "\n")
+cat("95% CI for mu_1:\n", mu_ci[c(1,2)], "\n")
+cat("95% CI for mu_2:\n", mu_ci[c(3,4)], "\n\n")
+
+cat("Posterior Mean of tau:\n", tau_est, "\n")
+cat("95% CI for tau:\n", tau_ci, "\n")
+
+# Number of rats and iterations
+n_rats <- dim(theta_post)[1]
+n_samples <- dim(theta_post)[3]
+
+# Create summary table
+theta_summary <- data.frame(
+  Rat = 1:n_rats,
+  Alpha_Mean = numeric(n_rats),
+  Alpha_Lower = numeric(n_rats),
+  Alpha_Upper = numeric(n_rats),
+  Beta_Mean = numeric(n_rats),
+  Beta_Lower = numeric(n_rats),
+  Beta_Upper = numeric(n_rats)
+)
+
+for (i in 1:n_rats) {
+  alpha_samples <- theta_post[i, 1, ]
+  beta_samples <- theta_post[i, 2, ]
+  
+  theta_summary$Alpha_Mean[i] <- mean(alpha_samples)
+  theta_summary$Alpha_Lower[i] <- quantile(alpha_samples, 0.025)
+  theta_summary$Alpha_Upper[i] <- quantile(alpha_samples, 0.975)
+  
+  theta_summary$Beta_Mean[i] <- mean(beta_samples)
+  theta_summary$Beta_Lower[i] <- quantile(beta_samples, 0.025)
+  theta_summary$Beta_Upper[i] <- quantile(beta_samples, 0.975)
+}
+
+# View summary
+print(theta_summary)
+```
+
+```{r}
+# CONVERGENCE DIAGNOSTICS
+
+
+mcmc_mu <- mcmc(mu_post)
+mcmc_tau <- mcmc(tau_post)
+
+# Trace plots
+traceplot(mcmc_mu[,1], main = "Traceplot of mu_1")
+traceplot(mcmc_mu[,2], main = "Traceplot of mu_2")
+traceplot(mcmc_tau, main = "Traceplot of tau")
+
+# Autocorrelation
+acf(mcmc_tau, main = "ACF of tau")
+
+# Gelman diagnostics (if using multiple chains)
+# gelman.diag(as.mcmc.list(list(chain1, chain2)))
+
+# Posterior density
+densplot(mcmc_mu[,1], main = "Posterior density of mu[1]")
+densplot(mcmc_mu[,2], main = "Posterior density of mu[2]")
+densplot(mcmc_tau, main = "Posterior density of tau")
+
+
+
+
+# Get alpha and beta
+alpha_post <- theta_post[, 1, ]
+beta_post <- theta_post[, 2, ]
+
+# Reshape the alpha and beta samples into a long format for plotting
+alpha_df <- data.frame(iteration = rep(1:9000, each = 30),
+                       value = as.vector(t(alpha_post)),  # Transpose to stack the columns (observations)
+                       observation = rep(1:30, times = 9000),
+                       param = "alpha")
+
+beta_df <- data.frame(iteration = rep(1:9000, each = 30),
+                      value = as.vector(t(beta_post)),
+                      observation = rep(1:30, times = 9000),
+                      param = "beta")
+
+# Combine the data frames for plotting
+theta_df <- rbind(alpha_df, beta_df)
+
+# Trace plots for alpha
+par(mfrow = c(5,2))
+for (i in 1:30) {
+  # Plot trace for alpha (i-th observation)
+  plot(1:9000, alpha_post[i, ], type = "l", 
+       main = paste("Trace plot for Alpha (Observation", i, ")"),
+       xlab = "Iteration", ylab = "Alpha Value", col = "black")
+}
+
+# Trace plots for beta
+par(mfrow = c(5,2))
+for (i in 1:30) {
+  # Plot trace for beta (i-th observation)
+  plot(1:9000, beta_post[i, ], type = "l", 
+       main = paste("Trace plot for Beta (Observation", i, ")"),
+       xlab = "Iteration", ylab = "Beta Value", col = "black")
+}
+
+
+
+
+# ACF plots for alpha
+par(mfrow = c(5,2))
+for (i in 1:30) {
+  # ACF for alpha (i-th observation)
+  acf(alpha_post[i, ], main = paste("ACF for Alpha (Observation", i, ")"))
+}
+
+# ACF plots for beta
+par(mfrow = c(5,2))
+for (i in 1:30) {
+  # ACF for beta (i-th observation)
+  acf(beta_post[i, ], main = paste("ACF for Beta (Observation", i, ")"))
+}
+```
+
