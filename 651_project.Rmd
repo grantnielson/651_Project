@@ -1,0 +1,143 @@
+---
+title: "651 project"
+author: "Grant Nielson"
+date: "2025-04-09"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+
+rat <- read_excel("ratdata.xlsx")
+
+#bar chart with rat_ across the x axis and value on y axis. Do 5 bars for each rat 
+
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(forcats)
+
+
+
+
+library(viridis)
+```
+
+```{r}
+# df <- rat[, -ncol(rat)]
+df <- rat
+
+# Add row number before pivoting
+df$row <- seq_len(nrow(df))
+
+#get rid of age column
+df <- df[, -which(names(df) == "age")]
+
+# Pivot longer
+df_long <- pivot_longer(df, cols = -row, names_to = "Rat", values_to = "Value")
+
+
+
+
+df_long <- df_long %>%
+  mutate(
+    Rat_num = as.numeric(gsub("[^0-9]", "", Rat)),  # Extract number
+    Rat = fct_reorder(Rat, Rat_num)                # Reorder by extracted number
+  )
+
+# Now plot, using 'row' as the x-axis
+ggplot(df_long, aes(x = factor(row), y = Value, fill = Rat)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Bar Chart of Rat Measurements by Row",
+    x = "Time of Measurement",
+    y = "Value"
+  ) +
+  scale_fill_viridis_d()
+
+
+ggplot(df_long, aes(x = Rat, y = Value, fill = factor(row))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Rat weights",
+    x = "Rat",
+    y = "Value",
+    fill = "Time of Measurement"
+  ) +
+  scale_fill_viridis_d()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+
+```
+
+```{r}
+#2 Regression for each rat
+df <- rat
+df$row <- seq_len(nrow(df))
+
+# Pivot all rat columns (everything except 'row' and 'age')
+df_long <- pivot_longer(df, cols = -c(row, age), names_to = "Rat", values_to = "Value")
+
+model <- list()  # initialize an empty list to store models
+for (rat in unique(df_long$Rat)) {
+  model[[as.character(rat)]] <- lm(Value ~ age, data = df_long[df_long$Rat == rat, ])
+}
+# Extract coefficients and store in a data frame
+coefficients <- do.call(rbind, lapply(model, function(m) {
+  data.frame(
+    Intercept = coef(m)[1],
+    Slope = coef(m)[2]
+  )
+}))
+
+model_summary <- lapply(names(model), function(rat) {
+  m <- summary(model[[rat]])
+  coef_val <- m$coefficients["age", "Estimate"]
+  p_val <- m$coefficients["age", "Pr(>|t|)"]
+  r_sq <- m$r.squared
+  
+  data.frame(
+    Rat = rat,
+    Coefficient = coef_val,
+    P_value = p_val,
+    R_squared = r_sq
+  )
+})
+
+# Combine into a single data frame
+model_summary_df <- do.call(rbind, model_summary)
+
+# View result
+print(model_summary_df)
+
+##
+model_summary <- lapply(names(model), function(rat) {
+  m <- summary(model[[rat]])
+  coef_val <- m$coefficients["age", "Estimate"]
+  p_val <- m$coefficients["age", "Pr(>|t|)"]
+  r_sq <- m$r.squared
+  
+  data.frame(
+    Rat = rat,
+    Coefficient = coef_val,
+    P_value = p_val,
+    R_squared = r_sq
+  )
+})
+
+# Combine into a single data frame
+model_summary_df <- do.call(rbind, model_summary)
+
+# View result
+print(model_summary_df)
+
+```
+
