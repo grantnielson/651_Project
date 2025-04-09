@@ -65,6 +65,52 @@ ggplot(rat_long, aes(x = factor(age), y = weight)) +
 The growth curves show that the rats grow in a mostly linear fashion. Obviously there is some variability, but overall I'd say that it's pretty linear. The growth rates are not very consistent (lots of ups and downs), but overall they're all pretty similar. For the most part the growth rate slows down between days 15-22, then speed up between days 22-29, and then decrease again from days 29-36. However, there are a few rate that increase in growth rate during the last time period. There are some exceptions to the rule here, but overall I'd say that the Normal model for $Y_{ij}$ is fairly reasonable.
 
 
+```{r}
+# Justify the prior
+library(MASS)       # For mvrnorm
+library(ggplot2)    # For prettier plots
+library(reshape2)   # For melt
+library(gridExtra)  # For side-by-side plots
+
+# Prior parameters
+eta <- c(0, 0)
+C <- diag(5, 2)
+lambda_0 <- 0.1
+nu_0 <- 0.1
+
+# Sample from prior
+set.seed(123)
+n_samples <- 100
+
+# Sample tau ~ Inv-Gamma
+# Inv-Gamma(a, b) → 1 / rgamma(n, shape = a, rate = b)
+tau <- 1 / rgamma(n_samples, shape = nu_0 / 2, rate = (nu_0 * lambda_0) / 2)
+
+# For each tau, sample alpha_c and beta_c ~ N2(eta, tau * C)
+alphas_betas <- t(sapply(tau, function(t) {
+  mvrnorm(1, mu = eta, Sigma = t * C)
+}))
+
+# Organize samples
+df <- data.frame(alpha_c = alphas_betas[,1],
+                 beta_c = alphas_betas[,2],
+                 tau = tau)
+
+# Marginal density plots
+p1 <- ggplot(df, aes(x = alpha_c)) + geom_density(fill = "skyblue") + ggtitle("Prior for alpha_c")
+p2 <- ggplot(df, aes(x = beta_c)) + geom_density(fill = "orange") + ggtitle("Prior for beta_c")
+p3 <- ggplot(df, aes(x = tau)) + geom_density(fill = "green") + ggtitle("Prior for tau")
+
+# Contour plot of joint (alpha_c, beta_c)
+p4 <- ggplot(df, aes(x = alpha_c, y = beta_c)) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", color = "black") +
+  scale_fill_viridis_c() + ggtitle("Joint Prior: alpha_c vs beta_c")
+
+# Plot all together
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+
 
 
 
@@ -116,17 +162,6 @@ I would say that the normality assumption is reasonable here. The distribution o
 # Gibbs Sampler
 
 ```{r}
-# rats = readxl::read_excel('./ratdata.xlsx')
-# rats <- melt(rats, id.vars = c("age"))
-# colnames(rats) <- c("age",'id','weight')
-# rat_data <- lapply(unique(rats$id), function(j) {
-#     that_rat <- rats[rats$id == j, ]
-#     that_rat$weight          # Response variable
-# })
-# X_i <- cbind(rep(1, 5), c(8, 15, 22, 29, 36))  # Define X_i once
-# XtX <- t(X_i) %*% X_i
-# Y_matrix <- do.call(cbind, rat_data)  # Combine all Y_i into a matrix (5 x 30)
-
 # Reshape data
 rats <- melt(ratdata, id.vars = c("age"))
 colnames(rats) <- c("age",'id','weight')
@@ -145,14 +180,9 @@ V <- solve(30 * Sigma_inv + C_inv)
 set.seed(123)
 
 # Prepare data
-# Y <- as.matrix(ratdata[, 1:30])
 age <- ratdata$age
 n <- 30  # number of rats
 t <- 5  # number of time points = 5
-
-# # Design matrix for each rat (same across rats)
-# X_list <- lapply(1:n, function(i) cbind(1, age))
-# Y_list <- lapply(1:n, function(i) Y[, i])
 
 # Design matrix
 rat_data <- lapply(unique(rats$id), function(j) {
@@ -295,6 +325,13 @@ ci_table <- data.frame(
 
 # View the table
 print(ci_table)
+
+
+
+
+# Covariance matrix of alpha_c, beta_c, tau
+joint <- cbind(alpha_c_post, beta_c_post, tau_post)
+cov(joint)
 ```
 
 ```{r}
@@ -410,78 +447,4 @@ None of them are far away enough from 0 to worry me too much, so I'm happy to co
 
 
 
-
-
-
-
-
-
-
-
-# Connor's Code
-
-
-```{r}
-# lambda0 = 0.1
-# nu0 = 0.1
-# eta = matrix(c(0,0),nrow=2)
-# Sigma = diag(x=10,2)
-# Sigma_inv = solve(Sigma)
-# C = diag(x=5,2)
-# C_inv = solve(C)
-# V = solve(30 * Sigma_inv + C_inv)
-# rats = readxl::read_excel('./ratdata.xlsx')
-# rats <- melt(rats, id.vars = c("age"))
-# colnames(rats) <- c("age",'id','weight')
-# rat_data <- lapply(unique(rats$id), function(j) {
-#     that_rat <- rats[rats$id == j, ]
-#     that_rat$weight          # Response variable
-# })
-# X_i <- cbind(rep(1, 5), c(8, 15, 22, 29, 36))  # Define X_i once
-# XtX <- t(X_i) %*% X_i
-# Y_matrix <- do.call(cbind, rat_data)  # Combine all Y_i into a matrix (5 x 30)
-# n_iter <- 10000
-# alphas = matrix(nrow=n_iter,ncol=30)
-# betas = matrix(nrow=n_iter,ncol=30)
-# mu_cs = matrix(nrow=n_iter,ncol=2)
-# taus = matrix(nrow=n_iter,ncol=1)
-# alpha = rep(0,30)
-# beta = rep(0,30)
-# mu_c = rep(0,2)
-# tau = 1
-# sses = rep(0,n_iter)
-# #pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
-# for(i in 1:n_iter){
-#     ## Update the Invidual paramters
-#     # Compute D_i_inv for all groups (same for all 30 rats)
-#     D_i_inv <- (1/tau) * XtX + Sigma_inv
-#     D_i <- solve(D_i_inv)
-#     # Compute means (2 × 30 matrix)
-#     means <- D_i %*% ((1/tau) * (t(X_i) %*% Y_matrix) + Sigma_inv %*% matrix(mu_c, ncol=30, nrow=2, byrow=FALSE))
-#     # Draw samples for all 30 groups at once (each row is a rat)
-#     new_params <- t(rmvnorm(n = 30, mean = rep(0, 2), sigma = D_i)) + means  # Ensuring correct shape
-#     # Extract alpha and beta
-#     alphas[i, ] <- alpha <- new_params[1, ]  # First row is alpha
-#     betas[i, ] <- beta <- new_params[2, ]   # Second row is beta
-#     # Compute SSE efficiently
-#     residuals <- Y_matrix - X_i %*% new_params
-#     sse <- sum(residuals^2)
-#     sses[i] <- sse  # Store SSE
-#     ## Update the group parameters
-#     theta_bar = matrix(c(mean(alpha),mean(beta)),nrow=2)
-#     mu_c = rmvnorm(n = 1,
-#                     mean = V %*% (30 * Sigma_inv %*% theta_bar + C_inv %*% eta),
-#                     sigma = V
-#                 )
-#     mu_c = as.vector(mu_c)
-#     mu_cs[i,] = mu_c
-#     ## update tau
-#     tau <- rinvgamma(n=1,
-#                         shape = (nu0 + 150)/ 2,
-#                         scale = (1/2) * (nu0 * lambda0 + sse)
-#                     )
-#     taus[i] <- tau
-#     #setTxtProgressBar(pb, i)
-# }
-```
 
